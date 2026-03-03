@@ -7,7 +7,6 @@ const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { BlobServiceClient, generateBlobSASQueryParameters, BlobSASPermissions, StorageSharedKeyCredential } = require('@azure/storage-blob');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -92,7 +91,7 @@ async function fetchTranscript(videoId, lang = 'en') {
   };
 }
 
-// --- Batch Diarization mode ---
+// --- Diarization mode (Fast Transcription API) ---
 
 function downloadAudio(videoId, outPath) {
   return new Promise((resolve, reject) => {
@@ -114,115 +113,30 @@ function downloadAudio(videoId, outPath) {
   });
 }
 
-async function uploadBlob(localPath, blobName) {
-  const client = BlobServiceClient.fromConnectionString(process.env.AZURE_STORAGE_CONNECTION_STRING);
-  const container = client.getContainerClient(process.env.AZURE_STORAGE_CONTAINER);
-  const blob = container.getBlockBlobClient(blobName);
-  await blob.uploadFile(localPath);
-
-  const connStr = process.env.AZURE_STORAGE_CONNECTION_STRING;
-  const accountName = connStr.match(/AccountName=([^;]+)/)?.[1];
-  const accountKey  = connStr.match(/AccountKey=([^;]+)/)?.[1];
-  if (!accountName || !accountKey) throw new Error('Could not parse storage account name/key from connection string');
-
-  const cred = new StorageSharedKeyCredential(accountName, accountKey);
-  const expiresOn = new Date(Date.now() + 2 * 60 * 60 * 1000);
-  const sas = generateBlobSASQueryParameters(
-    { containerName: process.env.AZURE_STORAGE_CONTAINER, blobName, permissions: BlobSASPermissions.parse('r'), expiresOn },
-    cred
-  ).toString();
-
-  return { sasUrl: `${blob.url}?${sas}`, blobClient: blob };
-}
-
-async function submitBatchJob(sasUrl) {
-  const region = process.env.AZURE_SPEECH_REGION;
-  const key    = process.env.AZURE_SPEECH_KEY;
-  const endpoint = `https://${region}.api.cognitive.microsoft.com/speechtotext/v3.2/transcriptions`;
-
-  const body = {
-    contentUrls: [sasUrl],
-    locale: 'en-US',
-    displayName: `yt-batch-${Date.now()}`,
-    properties: {
-      diarizationEnabled: true,
-      diarizationConfig: { minSpeakers: 1, maxSpeakers: 4 },
-      wordLevelTimestampsEnabled: false,
-      punctuationMode: 'DictatedAndAutomatic',
-      channels: [0],
-    },
-  };
-
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Ocp-Apim-Subscription-Key': key, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Batch job submit failed: ${res.status} ${await res.text()}`);
-  const json = await res.json();
-  if (!json.self) throw new Error('Batch job response missing self URL: ' + JSON.stringify(json));
-  return json.self;
-}
-
-async function pollBatchJob(jobUrl, intervalMs = 5000, timeoutMs = 20 * 60 * 1000) {
-  const key = process.env.AZURE_SPEECH_KEY;
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, intervalMs));
-    const res = await fetch(jobUrl, { headers: { 'Ocp-Apim-Subscription-Key': key } });
-    if (!res.ok) throw new Error(`Poll failed: ${res.status}`);
-    const job = await res.json();
-
-    if (job.status === 'Failed') throw new Error('Batch transcription job failed: ' + JSON.stringify(job.properties?.error));
-    if (job.status !== 'Succeeded') continue;
-
-    const filesRes = await fetch(job.links.files, { headers: { 'Ocp-Apim-Subscription-Key': key } });
-    if (!filesRes.ok) throw new Error(`Fetching result files failed: ${filesRes.status}`);
-    const files = await filesRes.json();
-
-    const resultFile = files.values.find(f => f.kind === 'Transcription');
-    if (!resultFile) throw new Error('No transcription result file found in batch job output');
-
-    const resultRes = await fetch(resultFile.links.contentUrl);
-    if (!resultRes.ok) throw new Error(`Fetching result content failed: ${resultRes.status}`);
-    return await resultRes.json();
-  }
-
-  throw new Error('Batch transcription timed out after 20 minutes');
-}
-
-async function deleteBatchJob(jobUrl) {
-  const key = process.env.AZURE_SPEECH_KEY;
-  await fetch(jobUrl, { method: 'DELETE', headers: { 'Ocp-Apim-Subscription-Key': key } }).catch(() => {});
-}
-
-function parseBatchTranscript(result) {
-  const phrases = result.recognizedPhrases || [];
+function parseFastTranscript(result) {
+  const phrases = result.phrases || [];
   if (!phrases.length) throw new Error('Azure returned no recognized phrases');
 
   const speakerMap = {};
   let speakerCount = 0;
 
   return phrases.map(phrase => {
-    const speakerId = phrase.speaker ?? 'Unknown';
-    const text = phrase.nBest?.[0]?.display ?? '';
-    if (!text.trim()) return null;
+    const text = (phrase.text || '').trim();
+    if (!text) return null;
 
-    if (speakerId === 'Unknown') return `Unknown: ${text.trim()}`;
+    const speakerId = phrase.speaker ?? 'Unknown';
+    if (speakerId === 'Unknown') return `Unknown: ${text}`;
     if (!speakerMap[speakerId]) {
       speakerCount++;
       speakerMap[speakerId] = `Speaker ${speakerCount}`;
     }
-    return `${speakerMap[speakerId]}: ${text.trim()}`;
+    return `${speakerMap[speakerId]}: ${text}`;
   }).filter(Boolean).join('\n');
 }
 
-async function batchDiarize(videoId) {
+async function fastDiarize(videoId) {
   const tmpId   = crypto.randomBytes(8).toString('hex');
   const tmpPath = path.join(os.tmpdir(), `yt_batch_${tmpId}`);
-  let blobClient = null;
-  let jobUrl     = null;
 
   try {
     await downloadAudio(videoId, tmpPath);
@@ -230,22 +144,29 @@ async function batchDiarize(videoId) {
     const audioPath = `${tmpPath}.mp3`;
     if (!fs.existsSync(audioPath)) throw new Error('yt-dlp did not produce an mp3 output file');
 
-    const blobName = `${tmpId}.mp3`;
-    const { sasUrl, blobClient: bc } = await uploadBlob(audioPath, blobName);
-    blobClient = bc;
-    fs.unlink(audioPath, () => {});
+    const region   = process.env.AZURE_SPEECH_REGION;
+    const key      = process.env.AZURE_SPEECH_KEY;
+    const endpoint = `https://${region}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15`;
 
-    jobUrl = await submitBatchJob(sasUrl);
+    const audioBytes = fs.readFileSync(audioPath);
+    const form = new FormData();
+    form.append('audio', new Blob([audioBytes], { type: 'audio/mpeg' }), `${tmpId}.mp3`);
+    form.append('definition', JSON.stringify({
+      locales: ['en-US'],
+      diarization: { enabled: true, maxSpeakers: 4 },
+    }));
 
-    const result = await pollBatchJob(jobUrl);
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Ocp-Apim-Subscription-Key': key },
+      body: form,
+    });
+    if (!res.ok) throw new Error(`Fast transcription failed: ${res.status} ${await res.text()}`);
 
-    blobClient.delete().catch(() => {});
-    blobClient = null;
-
-    return parseBatchTranscript(result);
+    const result = await res.json();
+    return parseFastTranscript(result);
   } finally {
-    if (blobClient) blobClient.delete().catch(() => {});
-    if (jobUrl) deleteBatchJob(jobUrl);
+    fs.unlink(`${tmpPath}.mp3`, () => {});
   }
 }
 
@@ -277,15 +198,12 @@ app.post('/transcript', async (req, res) => {
     if (!process.env.AZURE_SPEECH_KEY || !process.env.AZURE_SPEECH_REGION) {
       return res.status(500).json({ error: 'Azure Speech credentials not configured.' });
     }
-    if (!process.env.AZURE_STORAGE_CONNECTION_STRING || !process.env.AZURE_STORAGE_CONTAINER) {
-      return res.status(500).json({ error: 'Azure Storage credentials not configured.' });
-    }
 
     try {
-      const transcript = await batchDiarize(videoId);
+      const transcript = await fastDiarize(videoId);
       return res.json({ transcript, videoId, language: 'en-US', mode: 'batch' });
     } catch (err) {
-      return res.status(502).json({ error: err.message || 'Batch diarization failed.' });
+      return res.status(502).json({ error: err.message || 'Diarization failed.' });
     }
   }
 
