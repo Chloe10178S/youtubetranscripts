@@ -100,7 +100,7 @@ function downloadAudio(videoId, outPath) {
       '-f', 'bestaudio',
       '--extract-audio',
       '--audio-format', 'mp3',
-      '--audio-quality', '0',
+      '--audio-quality', '5',
       '--no-playlist',
       '-o', outPath,
       `https://www.youtube.com/watch?v=${videoId}`,
