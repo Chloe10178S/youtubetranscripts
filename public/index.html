@@ -122,6 +122,21 @@
     .transcript-body::-webkit-scrollbar { width: 6px; }
     .transcript-body::-webkit-scrollbar-track { background: transparent; }
     .transcript-body::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+
+    .mode-toggle { display: flex; gap: 0.5rem; align-items: center; }
+    .mode-label { font-size: 0.8rem; color: #555; }
+    .mode-btn {
+      padding: 0.4rem 1rem;
+      border-radius: 6px;
+      border: 1px solid #2e2e2e;
+      background: #1a1a1a;
+      color: #777;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .mode-btn.active { border-color: #ff4444; color: #fff; background: #1e1e1e; }
+    .mode-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -140,6 +155,7 @@
       const [error, setError] = useState(null);
       const [result, setResult] = useState(null);
       const [copied, setCopied] = useState(false);
+      const [mode, setMode] = useState('captions');
 
       const fetchTranscript = useCallback(async () => {
         const trimmed = url.trim();
@@ -151,7 +167,7 @@
           const res = await fetch('/transcript', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: trimmed }),
+            body: JSON.stringify({ url: trimmed, mode }),
           });
           const data = await res.json();
           if (!res.ok) {
@@ -164,7 +180,7 @@
         } finally {
           setLoading(false);
         }
-      }, [url]);
+      }, [url, mode]);
 
       const handleKeyDown = (e) => {
         if (e.key === 'Enter') fetchTranscript();
@@ -183,6 +199,20 @@
           <div className="header">
             <h1>YouTube Transcript Fetcher</h1>
             <p className="subtitle">Paste a YouTube URL to extract the full transcript.</p>
+          </div>
+
+          <div className="mode-toggle">
+            <span className="mode-label">Mode:</span>
+            <button
+              className={`mode-btn${mode === 'captions' ? ' active' : ''}`}
+              onClick={() => setMode('captions')}
+              disabled={loading}
+            >Captions (fast)</button>
+            <button
+              className={`mode-btn${mode === 'batch' ? ' active' : ''}`}
+              onClick={() => setMode('batch')}
+              disabled={loading}
+            >Speaker Diarization</button>
           </div>
 
           <div className="input-row">
@@ -206,7 +236,10 @@
           </div>
 
           {loading && (
-            <p className="status">Fetching transcript from YouTube…</p>
+            <p className="status">
+              {mode === 'captions' && 'Fetching transcript from YouTube…'}
+              {mode === 'batch' && 'Downloading audio and running speaker diarization… (typically 2–5 min)'}
+            </p>
           )}
 
           {error && (
@@ -220,6 +253,7 @@
               <div className="transcript-header">
                 <span className="transcript-meta">
                   Video ID: {result.videoId}&nbsp;&nbsp;·&nbsp;&nbsp;{result.segments} segments
+                  {result.mode === 'batch' && <>&nbsp;&nbsp;·&nbsp;&nbsp;Speaker Diarization</>}
                 </span>
                 <div className="header-actions">
                   <button
